@@ -1,0 +1,465 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Reactive Shader</title>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.150.0/build/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: Arial, sans-serif;
+        }
+        #canvas-container {
+            width: 100%;
+            max-width: 1200px;
+            height: 100vh;
+            margin: 0 auto;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+        }
+        canvas {
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            color: white;
+            max-width: 300px;
+            transition: opacity 0.3s;
+            z-index: 100;
+        }
+        #ui.collapsed {
+            opacity: 0.2;
+        }
+        #ui.collapsed:hover {
+            opacity: 1;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+        button {
+            background: #444;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #555;
+        }
+        #audio-source {
+            margin-top: 10px;
+        }
+        #file-input {
+            display: none;
+        }
+        .file-label {
+            display: inline-block;
+            padding: 5px 10px;
+            background: #444;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        .file-label:hover {
+            background: #555;
+        }
+        .audio-status {
+            font-size: 12px;
+            margin-top: 5px;
+            color: #aaa;
+        }
+        .active {
+            color: #4CAF50;
+        }
+        .error {
+            color: #F44336;
+        }
+    </style>
+
+<base target="_self">
+
+
+    </head><body><div id="canvas-container"></div>
+    <div id="ui">
+        <h3>Audio Reactive Shader</h3>
+        
+        <div class="control-group">
+            <label for="intensity">Intensity</label>
+            <input type="range" id="intensity" min="0" max="2" step="0.01" value="1">
+        </div>
+        
+        <div class="control-group">
+            <label for="speed">Speed</label>
+            <input type="range" id="speed" min="0" max="2" step="0.01" value="0.5">
+        </div>
+        
+        <div class="control-group">
+            <label for="color-speed">Color Speed</label>
+            <input type="range" id="color-speed" min="0" max="2" step="0.01" value="0.3">
+        </div>
+        
+        <div class="control-group">
+            <label for="bass-boost">Bass Boost</label>
+            <input type="range" id="bass-boost" min="0" max="2" step="0.01" value="1">
+        </div>
+        
+        <div id="audio-source">
+            <label>Audio Source:</label><br>
+            <label class="file-label" for="file-input">Upload</label>
+            <input type="file" id="file-input" accept="audio/*">
+            <button id="mic-button">Microphone</button>
+            <div id="audio-status" class="audio-status">No audio source selected</div>
+        </div>
+        
+        <button id="toggle-ui">Toggle UI</button>
+    </div>
+
+    <script>
+        // Check for WebGL support
+        if (!WebGLRenderingContext) {
+            const container = document.getElementById('canvas-container');
+            container.innerHTML = '<div style="color: white; text-align: center; padding: 20px;">Your browser does not support WebGL. Please try with a modern browser.</div>';
+            throw new Error('WebGL not supported');
+        }
+
+        // Main variables
+        let scene, camera, renderer, material, mesh;
+        let audioContext, analyser, dataArray, audioSource;
+        let fftSize = 256;
+        let isPlaying = false;
+        let lastUpdateTime = 0;
+
+        // Initialize Three.js
+        function initThreeJS() {
+            const container = document.getElementById('canvas-container');
+            
+            // Calculate dimensions respecting max-width
+            const maxWidth = 1200;
+            const aspectRatio = 16/9;
+            const width = Math.min(window.innerWidth, maxWidth);
+            const height = width / aspectRatio;
+            
+            // Create scene
+            scene = new THREE.Scene();
+            
+            // Create camera
+            camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
+            
+            // Create renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(width, height);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+            container.appendChild(renderer.domElement);
+            
+            // Create shader material
+            const uniforms = {
+                time: { value: 0 },
+                resolution: { value: new THREE.Vector2(width, height) },
+                intensity: { value: 1 },
+                speed: { value: 0.5 },
+                colorSpeed: { value: 0.3 },
+                bassBoost: { value: 1 },
+                audioData: { value: new Float32Array(fftSize/2) },
+                audioDataLength: { value: fftSize/2 }
+            };
+            
+            material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: `
+                    varying vec2 vUv;
+                    
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    precision highp float;
+                    
+                    uniform float time;
+                    uniform vec2 resolution;
+                    uniform float intensity;
+                    uniform float speed;
+                    uniform float colorSpeed;
+                    uniform float bassBoost;
+                    uniform float audioData[128];
+                    uniform int audioDataLength;
+                    
+                    varying vec2 vUv;
+                    
+                    // Hash function for random values
+                    float hash(float n) {
+                        return fract(sin(n) * 43758.5453);
+                    }
+                    
+                    // 2D noise function
+                    float noise(vec2 p) {
+                        vec2 ip = floor(p);
+                        vec2 u = fract(p);
+                        u = u * u * (3.0 - 2.0 * u);
+                        
+                        float res = mix(
+                            mix(hash(ip.x + 57.0 * hash(ip.y)), 
+                                hash(ip.x + 1.0 + 57.0 * hash(ip.y)), u.x),
+                            mix(hash(ip.x + 57.0 * hash(ip.y + 1.0)), 
+                                hash(ip.x + 1.0 + 57.0 * hash(ip.y + 1.0)), u.x),
+                            u.y);
+                        return res * 2.0 - 1.0;
+                    }
+                    
+                    // Fractional Brownian motion
+                    float fbm(vec2 p) {
+                        float f = 0.0;
+                        float amp = 0.5;
+                        for (int i = 0; i < 4; i++) {
+                            f += amp * noise(p);
+                            p *= 2.0;
+                            amp *= 0.5;
+                        }
+                        return f;
+                    }
+                    
+                    // Get audio value at frequency index
+                    float getAudioValue(int index) {
+                        if (index < 0 || index >= audioDataLength) return 0.0;
+                        return audioData[index];
+                    }
+                    
+                    // Main shader function
+                    void main() {
+                        vec2 uv = vUv * 2.0 - 1.0;
+                        uv.x *= resolution.x / resolution.y;
+                        
+                        // Get bass, mid and high frequencies
+                        float bass = 0.0;
+                        for (int i = 0; i < 10; i++) {
+                            bass += getAudioValue(i);
+                        }
+                        bass /= 10.0;
+                        bass *= bassBoost;
+                        
+                        float mid = 0.0;
+                        for (int i = 10; i < 40; i++) {
+                            mid += getAudioValue(i);
+                        }
+                        mid /= 30.0;
+                        
+                        float high = 0.0;
+                        for (int i = 40; i < 80; i++) {
+                            high += getAudioValue(i);
+                        }
+                        high /= 40.0;
+                        
+                        // Create fluid motion
+                        vec2 p = uv * 2.0;
+                        p += vec2(time * speed * 0.1, 0.0);
+                        
+                        float f = fbm(p * 2.0 + bass * 0.5);
+                        p += f * 0.2 * intensity;
+                        
+                        f += fbm(p * 4.0 + mid * 0.3);
+                        p += f * 0.1 * intensity;
+                        
+                        f += fbm(p * 8.0 + high * 0.2);
+                        
+                        // Color based on audio and position
+                        float hue = time * colorSpeed * 0.1 + f * 0.5 + bass * 0.2;
+                        vec3 color = 0.5 + 0.5 * cos(hue + vec3(0.0, 2.0, 4.0) + mid * 0.5);
+                        
+                        // Add highlights from high frequencies
+                        color += high * 0.3 * vec3(1.0, 1.0, 0.8);
+                        
+                        // Add pulsing from bass
+                        color *= 1.0 + bass * 0.2;
+                        
+                        // Final color with intensity control
+                        gl_FragColor = vec4(color * intensity, 1.0);
+                    }
+                `
+            });
+            
+            // Create full-screen quad
+            const geometry = new THREE.PlaneGeometry(2, 2);
+            mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+            
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize);
+            
+            // Start animation loop
+            animate();
+        }
+        
+        // Initialize audio
+        function initAudio() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = fftSize;
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                // File input handler
+                const fileInput = document.getElementById('file-input');
+                fileInput.addEventListener('change', handleFileUpload);
+                
+                // Microphone button handler
+                const micButton = document.getElementById('mic-button');
+                micButton.addEventListener('click', handleMicInput);
+                
+                // UI controls
+                document.getElementById('intensity').addEventListener('input', updateUniforms);
+                document.getElementById('speed').addEventListener('input', updateUniforms);
+                document.getElementById('color-speed').addEventListener('input', updateUniforms);
+                document.getElementById('bass-boost').addEventListener('input', updateUniforms);
+                
+                // Toggle UI button
+                document.getElementById('toggle-ui').addEventListener('click', () => {
+                    document.getElementById('ui').classList.toggle('collapsed');
+                });
+                
+                updateAudioStatus('No audio source selected');
+            } catch (e) {
+                console.error('Audio initialization error:', e);
+                updateAudioStatus('Audio not supported', true);
+            }
+        }
+        
+        // Handle file upload
+        function handleFileUpload(e) {
+            if (!audioContext) return;
+            
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                audioContext.decodeAudioData(event.target.result, (buffer) => {
+                    stopAudioSource();
+                    
+                    audioSource = audioContext.createBufferSource();
+                    audioSource.buffer = buffer;
+                    audioSource.connect(analyser);
+                    audioSource.connect(audioContext.destination);
+                    audioSource.loop = true;
+                    audioSource.start(0);
+                    
+                    isPlaying = true;
+                    updateAudioStatus('Playing: ' + file.name);
+                });
+            };
+            reader.readAsArrayBuffer(file);
+        }
+        
+        // Handle microphone input
+        function handleMicInput() {
+            if (!audioContext) return;
+            
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    stopAudioSource();
+                    
+                    audioSource = audioContext.createMediaStreamSource(stream);
+                    audioSource.connect(analyser);
+                    
+                    isPlaying = true;
+                    updateAudioStatus('Using microphone');
+                })
+                .catch(err => {
+                    console.error('Microphone access error:', err);
+                    updateAudioStatus('Microphone access denied', true);
+                });
+        }
+        
+        // Stop current audio source
+        function stopAudioSource() {
+            if (audioSource) {
+                audioSource.disconnect();
+                if (audioSource.stop) {
+                    audioSource.stop();
+                }
+                audioSource = null;
+            }
+            isPlaying = false;
+        }
+        
+        // Update audio status display
+        function updateAudioStatus(text, isError = false) {
+            const statusElement = document.getElementById('audio-status');
+            statusElement.textContent = text;
+            statusElement.className = isError ? 'audio-status error' : 'audio-status';
+        }
+        
+        // Update shader uniforms from UI
+        function updateUniforms() {
+            material.uniforms.intensity.value = parseFloat(document.getElementById('intensity').value);
+            material.uniforms.speed.value = parseFloat(document.getElementById('speed').value);
+            material.uniforms.colorSpeed.value = parseFloat(document.getElementById('color-speed').value);
+            material.uniforms.bassBoost.value = parseFloat(document.getElementById('bass-boost').value);
+        }
+        
+        // Handle window resize
+        function onWindowResize() {
+            const container = document.getElementById('canvas-container');
+            const maxWidth = 1200;
+            const aspectRatio = 16/9;
+            const width = Math.min(window.innerWidth, maxWidth);
+            const height = width / aspectRatio;
+            
+            renderer.setSize(width, height);
+            material.uniforms.resolution.value.set(width, height);
+            
+            // Adjust container height to maintain aspect ratio
+            container.style.height = `${height}px`;
+        }
+        
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const currentTime = performance.now();
+            const deltaTime = (currentTime - lastUpdateTime) / 1000;
+            lastUpdateTime = currentTime;
+            
+            // Update time uniform
+            material.uniforms.time.value += deltaTime;
+            
+            // Update audio data if playing
+            if (isPlaying && analyser) {
+                analyser.getByteFrequencyData(dataArray);
+                
+                // Convert to float array for shader (0-1 range)
+                const audioData = new Float32Array(fftSize/2);
+                for (let i = 0; i < fftSize/2; i++) {
+                    audioData[i] = dataArray[i] / 255.0;
+                }
+                
+                material.uniforms.audioData.value = audioData;
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        // Initialize everything
+        initThreeJS();
+        initAudio();
+    </script></body></html>
